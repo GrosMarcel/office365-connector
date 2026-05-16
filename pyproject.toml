@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-plugin-office365-connector"
+version = "3.0.0"
+description = "Office 365 / Outlook connector for Hermes Agent — email, calendar, multi-account OAuth via Microsoft Graph."
+readme = "SKILL.md"
+requires-python = ">=3.10"
+license = { text = "See CREDITS.md" }
+authors = [
+  { name = "office365-connector contributors" },
+]
+keywords = [
+  "hermes-agent",
+  "hermes-plugin",
+  "office365",
+  "outlook",
+  "microsoft-graph",
+  "oauth2",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: POSIX",
+  "Topic :: Communications :: Email",
+  "Topic :: Office/Business",
+]
+# Stdlib only — no runtime dependencies.
+dependencies = []
+
+[project.urls]
+Documentation = "https://hermes-agent.nousresearch.com/docs/guides/build-a-hermes-plugin"
+
+# This is the magic that makes the plugin discoverable after `pip install`.
+# Hermes scans `hermes_agent.plugins` entry points at startup and calls
+# `register(ctx)` on each module.
+[project.entry-points."hermes_agent.plugins"]
+office365-connector = "office365_connector"
+
+# Map the importable package name `office365_connector` to the current
+# directory so the existing flat layout (__init__.py, tools.py, schemas.py,
+# _security.py, _accounts.py, _auth.py, _graph.py at the top level) keeps
+# working without any file moves.
+[tool.setuptools]
+packages = ["office365_connector"]
+
+[tool.setuptools.package-dir]
+office365_connector = "."
+
+# Bundle the non-Python assets that ship with the plugin so the pip
+# install carries the manifest, docs, and references along with the code.
+[tool.setuptools.package-data]
+office365_connector = [
+  "plugin.yaml",
+  "SKILL.md",
+  "MULTI-ACCOUNT.md",
+  "CHANGELOG.md",
+  "CREDITS.md",
+  "references/*.md",
+]
