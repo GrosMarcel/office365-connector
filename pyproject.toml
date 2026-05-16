@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-plugin-office365-connector"
-version = "3.0.1"
+version = "3.0.2"
 description = "Office 365 / Outlook connector for Hermes Agent — email, calendar, multi-account OAuth via Microsoft Graph."
 readme = "SKILL.md"
 requires-python = ">=3.10"

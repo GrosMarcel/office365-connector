@@ -39,6 +39,8 @@ const SCOPES = [
   'offline_access'
 ].join(' ');
 
+const PENDING_PREFIX = '.pending-';
+
 function getAccountConfig(accountName) {
   try {
     return getAccount(accountName);
@@ -177,6 +179,138 @@ async function getAccessToken(accountName = null) {
   return tokens.access_token;
 }
 
+/**
+ * Per-account pending-flow state file. The stored device_code is itself a
+ * credential — file mode 0600 (enforced by secureWriteFileSync) prevents
+ * other users on the same host from racing the polling endpoint.
+ */
+function getPendingPath(accountConfig) {
+  const dir = path.dirname(accountConfig.tokenPath);
+  return path.join(dir, `${PENDING_PREFIX}${accountConfig.name}.json`);
+}
+
+/**
+ * Step 1 of a non-blocking device-code flow: request a device code, persist
+ * the pending state, and return the prompt info IMMEDIATELY. The caller is
+ * expected to surface verification_uri + user_code to the human, then loop
+ * on pollAuthenticate() until the flow resolves.
+ */
+async function beginAuthenticate(accountConfig) {
+  const existing = loadTokens(accountConfig);
+  if (existing && existing.expires_at > Date.now()) {
+    return { status: 'already_authenticated', account: accountConfig.name, expires_at_ms: existing.expires_at };
+  }
+
+  const dc = await requestDeviceCode(accountConfig);
+  if (!dc || !dc.device_code) {
+    throw new Error('Authority did not return a device code');
+  }
+
+  const interval = Math.max(1, parseInt(dc.interval, 10) || 5);
+  const expiresIn = parseInt(dc.expires_in, 10) || 600;
+  const pending = {
+    device_code: dc.device_code,
+    interval,
+    expires_at: Math.floor(Date.now() / 1000) + expiresIn,
+    account: accountConfig.name
+  };
+  secureWriteFileSync(getPendingPath(accountConfig), JSON.stringify(pending));
+
+  return {
+    status: 'pending_started',
+    account: accountConfig.name,
+    verification_uri: dc.verification_uri,
+    user_code: dc.user_code,
+    expires_in: expiresIn,
+    poll_interval_s: interval
+  };
+}
+
+/**
+ * Step 2 of a non-blocking device-code flow: read the pending state and do
+ * EXACTLY ONE poll of the token endpoint. Returns a single status snapshot.
+ * Caller is expected to re-run periodically until status leaves 'pending'.
+ */
+async function pollAuthenticate(accountConfig) {
+  const pendingPath = getPendingPath(accountConfig);
+  const pending = secureReadJsonSync(pendingPath);
+
+  if (!pending) {
+    const existing = loadTokens(accountConfig);
+    if (existing && existing.expires_at > Date.now()) {
+      return { status: 'already_authenticated', account: accountConfig.name, expires_at_ms: existing.expires_at };
+    }
+    return { status: 'no_pending_flow', account: accountConfig.name, message: 'Run login first.' };
+  }
+
+  if (Math.floor(Date.now() / 1000) >= pending.expires_at) {
+    try { fs.unlinkSync(pendingPath); } catch (_) { /* ignore */ }
+    return { status: 'expired', account: accountConfig.name };
+  }
+
+  try {
+    const tokenResponse = await pollForToken(pending.device_code, accountConfig);
+    const saved = saveTokens(tokenResponse, accountConfig);
+    try { fs.unlinkSync(pendingPath); } catch (_) { /* ignore */ }
+    return { status: 'authenticated', account: accountConfig.name, expires_at_ms: saved.expires_at };
+  } catch (error) {
+    const msg = scrubSecrets(error.message || '');
+    if (msg.includes('authorization_pending') || msg.includes('AADSTS70016')) {
+      return { status: 'pending', account: accountConfig.name, next_poll_in_s: pending.interval };
+    }
+    if (msg.includes('authorization_declined')) {
+      try { fs.unlinkSync(pendingPath); } catch (_) { /* ignore */ }
+      return { status: 'declined', account: accountConfig.name };
+    }
+    if (msg.includes('expired_token') || msg.includes('AADSTS70019')) {
+      try { fs.unlinkSync(pendingPath); } catch (_) { /* ignore */ }
+      return { status: 'expired', account: accountConfig.name };
+    }
+    if (msg.includes('slow_down')) {
+      return { status: 'pending', account: accountConfig.name, next_poll_in_s: pending.interval * 2 };
+    }
+    throw error;
+  }
+}
+
+/**
+ * DNS + TLS reachability check for the two hosts the plugin contacts. Helps
+ * tell apart "network is broken inside this container" from "flow logic is
+ * broken" when login appears to hang.
+ */
+async function diagnose() {
+  const dns = require('dns').promises;
+  const tls = require('tls');
+  const results = {};
+  for (const host of ['login.microsoftonline.com', 'graph.microsoft.com']) {
+    const entry = {};
+    try {
+      const { address } = await dns.lookup(host);
+      entry.ip = address;
+      entry.dns = 'ok';
+    } catch (e) {
+      entry.dns = `error: ${e.message}`;
+      results[host] = entry;
+      continue;
+    }
+    try {
+      await new Promise((resolve, reject) => {
+        const socket = tls.connect(
+          { host, port: 443, servername: host },
+          () => { socket.end(); resolve(); }
+        );
+        socket.setTimeout(5000, () => { socket.destroy(); reject(new Error('TLS connect timeout')); });
+        socket.on('error', reject);
+      });
+      entry.tls = 'ok';
+    } catch (e) {
+      entry.tls = `error: ${e.message}`;
+    }
+    results[host] = entry;
+  }
+  return { hosts: results };
+}
+
 async function authenticate(accountName = null) {
   const accountConfig = getAccountConfig(accountName);
 
@@ -251,10 +385,63 @@ if (require.main === module) {
     }
 
     if (command === 'login') {
+      // Default (non-blocking) behavior:
+      //   - First call: requests a device code, writes pending state, prints
+      //     the prompt, exits 0. The caller surfaces the code to the human.
+      //   - Subsequent calls: poll once and return current status.
+      // This is what makes the flow survive short LLM tool timeouts. Pass
+      // --blocking to keep the legacy single-call behavior.
+      const blocking = process.argv.includes('--blocking');
+
       try {
-        await authenticate(accountName);
+        if (blocking) {
+          await authenticate(accountName);
+          process.exit(0);
+        }
+
+        const accountConfig = getAccountConfig(accountName);
+        const pendingPath = getPendingPath(accountConfig);
+        let result;
+        if (fs.existsSync(pendingPath)) {
+          result = await pollAuthenticate(accountConfig);
+        } else {
+          result = await beginAuthenticate(accountConfig);
+        }
+        // Structured JSON to stdout for callers; pretty hint to stderr for humans.
+        process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+        if (result.status === 'pending_started') {
+          console.error(`\n📱 Open ${result.verification_uri} and enter code ${result.user_code}.`);
+          console.error(`   Re-run \`node auth.js login --account=${accountConfig.name}\` every ${result.poll_interval_s}s until authenticated.\n`);
+        } else if (result.status === 'pending') {
+          console.error(`\n⏳ Still waiting for the browser step. Retry in ${result.next_poll_in_s}s.\n`);
+        } else if (result.status === 'authenticated' || result.status === 'already_authenticated') {
+          console.error('\n✅ Authenticated.\n');
+        } else if (result.status === 'expired') {
+          console.error('\n❌ Device code expired before completion. Run login again to get a fresh code.\n');
+        } else if (result.status === 'declined') {
+          console.error('\n❌ User declined the authorization request.\n');
+        }
+        const exitMap = {
+          authenticated: 0,
+          already_authenticated: 0,
+          pending_started: 0,
+          pending: 3,         // distinct exit code so callers know to loop
+          expired: 4,
+          declined: 4,
+          no_pending_flow: 0
+        };
+        process.exit(exitMap[result.status] != null ? exitMap[result.status] : 1);
       } catch (err) {
         console.error('\n❌ Authentication failed:', scrubSecrets(err.message));
+        process.exit(1);
+      }
+    } else if (command === 'diag') {
+      try {
+        const result = await diagnose();
+        process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+        process.exit(0);
+      } catch (err) {
+        console.error('❌', scrubSecrets(err.message));
         process.exit(1);
       }
     } else if (command === 'status') {
@@ -296,10 +483,17 @@ if (require.main === module) {
       }
     } else {
       console.log('Usage:');
-      console.log('  node auth.js login [--account=name]              - Authenticate with Microsoft');
-      console.log('  node auth.js status [--account=name]             - Check authentication status');
-      console.log('  node auth.js token [--account=name] --confirm    - Print current access token (sensitive)');
+      console.log('  node auth.js login [--account=name]                  - Non-blocking auth: returns user_code, then polls on each rerun.');
+      console.log('                                                          Exit codes: 0=authenticated/started, 3=pending (rerun), 4=expired/declined.');
+      console.log('  node auth.js login [--account=name] --blocking       - Legacy blocking flow (NOT recommended, may exceed LLM timeouts).');
+      console.log('  node auth.js status [--account=name]                 - Check authentication status.');
+      console.log('  node auth.js token  [--account=name] --confirm       - Print current access token (sensitive).');
+      console.log('  node auth.js diag                                    - DNS + TLS reachability check for Microsoft endpoints.');
       console.log('\nIf --account is not specified, the default account is used.');
+      console.log('\nDevice-code flow (non-blocking):');
+      console.log('  1. Run `node auth.js login --account=work`. Prints verification URL + code.');
+      console.log('  2. Complete the browser step in a normal session.');
+      console.log('  3. Re-run the same command every ~5s until exit code is 0.');
       process.exit(1);
     }
   })();
@@ -307,7 +501,11 @@ if (require.main === module) {
 
 module.exports = {
   authenticate,
+  beginAuthenticate,
+  pollAuthenticate,
+  diagnose,
   getAccessToken,
+  getPendingPath,
   loadTokens,
   saveTokens,
   refreshAccessToken

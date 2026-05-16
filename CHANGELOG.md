@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.2] - 2026-05-16
+
+### Fixed — same non-blocking auth fix, now also in the v2 Node.js scripts
+
+The v3.0.1 release fixed the blocking device-code loop in the Python
+package, but many deployments still load the legacy Node.js scripts
+(`node auth.js login`) — either because the Python entry point isn't
+discovered or because the agent shells out to `node` directly. The same
+LLM-tool-timeout problem hit those callers too.
+
+This release backports the begin/poll split into `auth.js`:
+
+- `node auth.js login [--account=NAME]` is now **non-blocking by default**.
+  - First invocation: requests a device code, persists state at
+    `~/.hermes/auth/office365/.pending-<account>.json` (mode 0600), prints
+    the prompt JSON to stdout + a human hint to stderr, exits 0.
+  - Subsequent invocations: poll the token endpoint once, return the
+    current status (`pending` / `authenticated` / `expired` / `declined`)
+    and exit with code 0 (terminal), 3 (still pending — caller should
+    rerun), or 4 (terminal failure).
+- `node auth.js login --account=NAME --blocking` keeps the v2 single-call
+  behavior for back-compat.
+- `node auth.js diag` — new subcommand. DNS + TLS reachability check for
+  `login.microsoftonline.com` and `graph.microsoft.com`. Run this first
+  whenever the login appears to hang.
+
+Both the Python plugin and the Node.js scripts now share the same
+pending-flow state file format, so they can interoperate (begin in one,
+poll in the other) if needed.
+
 ## [3.0.1] - 2026-05-16
 
 ### Fixed
