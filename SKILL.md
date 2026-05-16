@@ -131,8 +131,10 @@ All tools accept an optional `account` argument; omitted means "use the default 
 - `office365_accounts_import_legacy` — migrate a v1 single-account setup
 
 ### Authentication
-- `office365_auth_login` — run the OAuth 2.0 device-code flow; returns the verification URL + user code
-- `office365_auth_status` — report whether the account is authenticated and token expiry
+- `office365_auth_login` — **start** the OAuth 2.0 device-code flow (non-blocking); returns the verification URL + user code immediately
+- `office365_auth_login_poll` — poll once for completion of the in-flight flow; the agent calls this every ~5 s until status is `authenticated`
+- `office365_auth_status` — report whether the account is authenticated, when the token expires, and whether a device-code flow is in progress
+- `office365_auth_diag` — DNS + TLS reachability check for `login.microsoftonline.com` and `graph.microsoft.com`; use when login appears to hang
 
 ### Email
 - `office365_email_recent` — most recent inbox messages
@@ -216,13 +218,44 @@ env:
 
 ## Authentication Flow
 
-OAuth 2.0 Device Code Flow, run inside `office365_auth_login`:
+OAuth 2.0 Device Code Flow, split into a non-blocking pair to survive LLM
+tool-call timeouts:
 
-1. Plugin requests a device code from `login.microsoftonline.com`.
-2. Tool returns the verification URL and short user code to the agent, which surfaces both to the human.
-3. Plugin polls the token endpoint at the authority-supplied interval.
-4. On success, access + refresh tokens are written atomically (mode 0600) to the per-account file.
-5. Subsequent tool calls refresh the access token transparently whenever it's within 5 minutes of expiry.
+1. Agent calls `office365_auth_login(account="work")` → plugin requests a
+   device code from `login.microsoftonline.com` and **returns immediately**
+   with the verification URL, user code, expiry, and poll interval. State
+   is persisted at `~/.hermes/auth/office365/.pending-<account>.json` (mode
+   0600).
+2. Agent surfaces the prompt to the human ("Open …/devicelogin and enter
+   ABC-DEF-123").
+3. Agent calls `office365_auth_login_poll(account="work")` every ~5 s.
+   Each call is one HTTPS request → returns `pending`, `authenticated`,
+   `expired`, or `declined`.
+4. On `authenticated`, plugin writes access + refresh tokens atomically
+   (mode 0600) and removes the pending state file.
+5. Subsequent tool calls refresh the access token transparently whenever
+   it's within 5 minutes of expiry — no further user interaction needed.
+
+### Standalone CLI fallback
+
+If the agent's tool timeout is still too short, or you want to produce a
+token file outside Hermes (e.g. on your laptop, then `docker cp` it into
+the container), use the bundled CLI:
+
+```bash
+# Run on any host that can open a browser and reach Microsoft:
+python -m office365_connector login --account=work
+# → prints the verification URL + code, blocks until you complete the flow,
+#   then writes ~/.hermes/auth/office365/work.json (mode 0600).
+
+# Copy into a container that can't run the device flow:
+docker cp ~/.hermes/auth/office365/work.json \
+  hermes:/root/.hermes/auth/office365/work.json
+docker exec hermes chmod 600 /root/.hermes/auth/office365/work.json
+```
+
+The plugin picks up the file on the next tool call — refresh tokens then
+take over and you never need to redo the device flow on that host.
 
 ## Security Posture (carried over from v2)
 
@@ -240,13 +273,33 @@ Microsoft Graph: 130,000 requests/hour per app; per-user limits vary. The plugin
 
 ## Troubleshooting
 
-**"Not authenticated for account 'x'"** — call `office365_auth_login` for that account.
+**Device-code login hangs or "times out" inside Docker** — this was a v3.0.0
+bug fixed in v3.0.1. If you're still on v3.0.0, upgrade:
 
-**"No account specified and no default account set"** — call `office365_accounts_set_default` or pass `account="..."` explicitly.
+```bash
+docker exec hermes pip install --upgrade \
+  "git+https://github.com/<owner>/office365-connector.git@v3.0.1"
+docker restart hermes
+```
 
-**"AADSTS700016 / 65001 / 700082"** — verify the Azure App Registration, ensure consent has been granted, or re-run `office365_auth_login`.
+If it still hangs on v3.0.1+, run `office365_auth_diag` — that distinguishes
+DNS, TLS, and HTTP-layer failures. Inside locked-down containers, outbound
+443 to `login.microsoftonline.com` may be blocked; use the standalone CLI
+on a permitted host and copy the token file (see "Authentication Flow"
+above).
 
-**"403 Forbidden"** — check that the delegated permissions in [references/permissions.md](references/permissions.md) are granted and consented in Azure.
+**"Not authenticated for account 'x'"** — call `office365_auth_login` for
+that account, then `office365_auth_login_poll` until completion.
+
+**"No account specified and no default account set"** — call
+`office365_accounts_set_default` or pass `account="..."` explicitly.
+
+**"AADSTS700016 / 65001 / 700082"** — verify the Azure App Registration,
+ensure consent has been granted, or re-run the auth flow.
+
+**"403 Forbidden"** — check that the delegated permissions in
+[references/permissions.md](references/permissions.md) are granted and
+consented in Azure.
 
 ## Limitations
 

@@ -92,9 +92,28 @@ ACCOUNTS_IMPORT_LEGACY = {
 AUTH_LOGIN = {
     "name": "office365_auth_login",
     "description": (
-        "Start the OAuth 2.0 device-code authentication flow for an Office 365 account. "
-        "Returns the verification URL and user code that the human must enter in a browser; "
-        "the tool then polls until tokens are issued or the device code expires."
+        "Start the OAuth 2.0 device-code authentication flow. Returns IMMEDIATELY "
+        "(non-blocking) with a verification URL and user code that the human must "
+        "enter in a browser. After surfacing the prompt to the user, call "
+        "office365_auth_login_poll every ~5 seconds (or whatever poll_interval_s "
+        "the response indicates) until status is 'authenticated', 'expired', or "
+        "'declined'. This split avoids LLM tool-call timeouts that would otherwise "
+        "kill a multi-minute blocking flow."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {**_ACCOUNT_PROP},
+        "required": [],
+    },
+}
+
+AUTH_LOGIN_POLL = {
+    "name": "office365_auth_login_poll",
+    "description": (
+        "Poll the token endpoint once to check whether the human has completed "
+        "the in-flight device-code flow. Call this after office365_auth_login, "
+        "repeatedly, at the interval reported by that call. Returns a status of "
+        "'authenticated', 'pending', 'expired', 'declined', or 'no_pending_flow'."
     ),
     "parameters": {
         "type": "object",
@@ -105,12 +124,28 @@ AUTH_LOGIN = {
 
 AUTH_STATUS = {
     "name": "office365_auth_status",
-    "description": "Report whether the Office 365 account is currently authenticated and when the access token expires.",
+    "description": (
+        "Report whether the Office 365 account is currently authenticated, when "
+        "the access token expires, and whether a device-code flow is currently "
+        "in progress."
+    ),
     "parameters": {
         "type": "object",
         "properties": {**_ACCOUNT_PROP},
         "required": [],
     },
+}
+
+AUTH_DIAG = {
+    "name": "office365_auth_diag",
+    "description": (
+        "Diagnose outbound network reachability to login.microsoftonline.com "
+        "and graph.microsoft.com from the current runtime. Use this when "
+        "auth_login appears to hang or fail — it distinguishes DNS, TLS, and "
+        "HTTP-layer failures, which is the first thing to check inside a "
+        "container."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
 EMAIL_RECENT = {
@@ -293,7 +328,9 @@ ALL = [
     ACCOUNTS_SET_DEFAULT,
     ACCOUNTS_IMPORT_LEGACY,
     AUTH_LOGIN,
+    AUTH_LOGIN_POLL,
     AUTH_STATUS,
+    AUTH_DIAG,
     EMAIL_RECENT,
     EMAIL_SEARCH,
     EMAIL_FROM_SENDER,

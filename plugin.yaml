@@ -1,5 +1,5 @@
 name: office365-connector
-version: 3.0.0
+version: 3.0.1
 description: |
   Office 365 / Outlook connector for Hermes Agent. Provides email (read/send),
   calendar (read/write), and contact-aware tools backed by Microsoft Graph,
@@ -12,7 +12,9 @@ provides_tools:
   - office365_accounts_set_default
   - office365_accounts_import_legacy
   - office365_auth_login
+  - office365_auth_login_poll
   - office365_auth_status
+  - office365_auth_diag
   - office365_email_recent
   - office365_email_search
   - office365_email_from_sender

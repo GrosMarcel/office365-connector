@@ -99,29 +99,35 @@ def accounts_import_legacy(args: dict, **_kwargs) -> str:
 # -------- auth --------
 
 def auth_login(args: dict, **_kwargs) -> str:
-    """Run the device-code flow. Returns the prompt + final status as a single payload."""
-    prompt_holder: dict[str, Any] = {}
+    """Start the device-code flow and return immediately with the prompt info.
 
-    def _on_prompt(verification_uri, user_code, expires_in):
-        prompt_holder.update(
-            {
-                "verification_uri": verification_uri,
-                "user_code": user_code,
-                "expires_in": expires_in,
-            }
-        )
-
+    Non-blocking: the LLM should surface the user_code + verification_uri to
+    the human, then call `office365_auth_login_poll` until status is
+    `authenticated` (or `expired` / `declined`).
+    """
     try:
-        result = _auth.authenticate(_account(args), on_prompt=_on_prompt)
-        return _ok({"prompt": prompt_holder or None, **result})
+        return _ok(_auth.begin_authenticate(_account(args)))
     except Exception as e:
-        payload = {"prompt": prompt_holder or None, "error": scrub_secrets(str(e))}
-        return json.dumps({"ok": False, **payload}, ensure_ascii=False)
+        return _err(e)
+
+
+def auth_login_poll(args: dict, **_kwargs) -> str:
+    try:
+        return _ok(_auth.poll_authenticate(_account(args)))
+    except Exception as e:
+        return _err(e)
 
 
 def auth_status(args: dict, **_kwargs) -> str:
     try:
         return _ok(_auth.auth_status(_account(args)))
+    except Exception as e:
+        return _err(e)
+
+
+def auth_diag(args: dict, **_kwargs) -> str:
+    try:
+        return _ok(_auth.diagnose())
     except Exception as e:
         return _err(e)
 

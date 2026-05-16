@@ -2,10 +2,16 @@
 
 Tokens written atomically at mode 0600 under
 ~/.hermes/auth/office365/<account>.json. Refresh is automatic.
+
+The device-code flow is split into a non-blocking `begin` + `poll` pair so
+that LLM tool-call timeouts (typically 30-120 s) don't kill the flow while
+the human completes the browser step (which can take minutes). The blocking
+`authenticate()` is kept for the standalone CLI.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -20,6 +26,8 @@ from ._security import (
     secure_read_json,
     secure_write_file,
 )
+
+PENDING_PREFIX = ".pending-"
 
 SCOPES = " ".join(
     [
@@ -159,6 +167,135 @@ def get_access_token(account_name: str | None = None) -> str:
     return tokens["access_token"]
 
 
+def _pending_path(cfg: dict[str, Any]) -> str:
+    """Per-account state file for an in-flight device-code flow.
+
+    Mode 0600 because the stored device_code is itself a credential — anyone
+    who can read it can race the polling endpoint.
+    """
+    token_dir = os.path.dirname(cfg["tokenPath"])
+    return os.path.join(token_dir, f"{PENDING_PREFIX}{cfg['name']}.json")
+
+
+def begin_authenticate(account_name: str | None = None) -> dict[str, Any]:
+    """Start the device-code flow and return the prompt info immediately.
+
+    The returned `user_code` / `verification_uri` must be surfaced to the
+    human. Then poll with `poll_authenticate()` until the human completes
+    the browser step. Each call to this function invalidates any previously
+    pending flow for the same account.
+    """
+    cfg = _get_account_config(account_name)
+
+    existing = _load_tokens(cfg)
+    if existing and existing["expires_at"] > int(time.time() * 1000):
+        return {
+            "status": "already_authenticated",
+            "account": cfg["name"],
+            "expires_at_ms": existing["expires_at"],
+        }
+
+    dc = _request_device_code(cfg)
+    if not isinstance(dc, dict) or not dc.get("device_code"):
+        raise RuntimeError("Authority did not return a device code")
+
+    interval = max(1, int(dc.get("interval") or 5))
+    expires_in = int(dc.get("expires_in") or 600)
+
+    pending = {
+        "device_code": dc["device_code"],
+        "interval": interval,
+        "expires_at": int(time.time()) + expires_in,
+        "account": cfg["name"],
+    }
+    secure_write_file(_pending_path(cfg), json.dumps(pending))
+
+    return {
+        "status": "pending",
+        "account": cfg["name"],
+        "verification_uri": dc.get("verification_uri"),
+        "user_code": dc.get("user_code"),
+        "expires_in": expires_in,
+        "poll_interval_s": interval,
+        "instructions": (
+            f"Open {dc.get('verification_uri')} and enter code "
+            f"{dc.get('user_code')}. Then call office365_auth_login_poll "
+            f"every ~{interval}s until status is 'authenticated'."
+        ),
+    }
+
+
+def poll_authenticate(account_name: str | None = None) -> dict[str, Any]:
+    """Do a single non-blocking poll of the token endpoint.
+
+    Returns one of:
+      - {"status": "authenticated", ...}
+      - {"status": "pending", "next_poll_in_s": N}
+      - {"status": "expired"}        # device code TTL elapsed
+      - {"status": "declined"}       # user clicked Cancel
+      - {"status": "no_pending_flow"}# nothing in progress for this account
+
+    Side effect: on success, writes the token file and removes the pending
+    state file. On terminal failure, removes the pending state file.
+    """
+    cfg = _get_account_config(account_name)
+    pending_path = _pending_path(cfg)
+    pending = secure_read_json(pending_path)
+
+    if not pending:
+        existing = _load_tokens(cfg)
+        if existing and existing["expires_at"] > int(time.time() * 1000):
+            return {
+                "status": "already_authenticated",
+                "account": cfg["name"],
+                "expires_at_ms": existing["expires_at"],
+            }
+        return {
+            "status": "no_pending_flow",
+            "account": cfg["name"],
+            "message": "Call office365_auth_login first to start the flow.",
+        }
+
+    if int(time.time()) >= int(pending["expires_at"]):
+        with contextlib.suppress(OSError):
+            os.unlink(pending_path)
+        return {"status": "expired", "account": cfg["name"]}
+
+    try:
+        token_response = _poll_for_token(pending["device_code"], cfg)
+        saved = _save_tokens(token_response, cfg)
+        with contextlib.suppress(OSError):
+            os.unlink(pending_path)
+        return {
+            "status": "authenticated",
+            "account": cfg["name"],
+            "expires_at_ms": saved["expires_at"],
+        }
+    except RuntimeError as e:
+        msg = scrub_secrets(str(e))
+        if "authorization_pending" in msg or "AADSTS70016" in msg:
+            return {
+                "status": "pending",
+                "account": cfg["name"],
+                "next_poll_in_s": int(pending["interval"]),
+            }
+        if "authorization_declined" in msg:
+            with contextlib.suppress(OSError):
+                os.unlink(pending_path)
+            return {"status": "declined", "account": cfg["name"]}
+        if "expired_token" in msg or "AADSTS70019" in msg:
+            with contextlib.suppress(OSError):
+                os.unlink(pending_path)
+            return {"status": "expired", "account": cfg["name"]}
+        if "slow_down" in msg:
+            return {
+                "status": "pending",
+                "account": cfg["name"],
+                "next_poll_in_s": int(pending["interval"]) * 2,
+            }
+        raise
+
+
 def authenticate(account_name: str | None = None, on_prompt=None) -> dict[str, Any]:
     """Run the OAuth 2.0 device code flow.
 
@@ -212,8 +349,20 @@ def authenticate(account_name: str | None = None, on_prompt=None) -> dict[str, A
 def auth_status(account_name: str | None = None) -> dict[str, Any]:
     cfg = _get_account_config(account_name)
     tokens = _load_tokens(cfg)
+    pending = secure_read_json(_pending_path(cfg))
+    pending_state: dict[str, Any] | None = None
+    if pending:
+        pending_state = {
+            "expires_at": int(pending["expires_at"]),
+            "expires_in_s": max(0, int(pending["expires_at"]) - int(time.time())),
+        }
+
     if not tokens:
-        return {"account": cfg["name"], "authenticated": False}
+        return {
+            "account": cfg["name"],
+            "authenticated": False,
+            "pending_flow": pending_state,
+        }
 
     now_ms = int(time.time() * 1000)
     expired = tokens["expires_at"] < now_ms
@@ -223,4 +372,41 @@ def auth_status(account_name: str | None = None) -> dict[str, Any]:
         "expired": expired,
         "expires_at_ms": tokens["expires_at"],
         "scope": tokens.get("scope"),
+        "pending_flow": pending_state,
     }
+
+
+def diagnose() -> dict[str, Any]:
+    """Network reachability check for the two pinned hosts.
+
+    Useful for diagnosing the "tool call times out" case — distinguishes
+    DNS failure, TCP/TLS failure, and HTTP-layer failure inside containers
+    where outbound networking is restricted.
+    """
+    import socket
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    results: dict[str, Any] = {}
+    for host in ("login.microsoftonline.com", "graph.microsoft.com"):
+        entry: dict[str, Any] = {}
+        try:
+            entry["ip"] = socket.gethostbyname(host)
+            entry["dns"] = "ok"
+        except Exception as e:
+            entry["dns"] = f"error: {e}"
+            results[host] = entry
+            continue
+        try:
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(f"https://{host}/", method="HEAD")
+            urllib.request.urlopen(req, timeout=5, context=ctx).read(0)
+            entry["https"] = "ok"
+        except urllib.error.HTTPError as e:
+            # Any HTTP response means TLS + transport are fine.
+            entry["https"] = f"ok (http {e.code})"
+        except Exception as e:
+            entry["https"] = f"error: {e}"
+        results[host] = entry
+    return {"hosts": results}

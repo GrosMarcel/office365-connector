@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.1] - 2026-05-16
+
+### Fixed
+
+- **`office365_auth_login` no longer blocks** until the device-code flow
+  completes. Previously, the tool's `time.sleep()` polling loop ran for up
+  to 10 minutes inside a single tool call, which exceeds typical LLM
+  tool-call timeouts and made authentication impossible from many runtimes
+  (notably containerised Hermes deployments).
+
+### Added
+
+- `office365_auth_login` now returns immediately with the prompt info
+  (verification URL + user code) and writes a per-account pending-flow
+  state file at `~/.hermes/auth/office365/.pending-<account>.json`.
+- **`office365_auth_login_poll`** — new tool. The agent calls this
+  repeatedly (every ~5 s) until status is `authenticated`, `expired`, or
+  `declined`. Each call is a single non-blocking HTTPS request.
+- **`office365_auth_diag`** — new tool. Reports DNS + TLS reachability to
+  `login.microsoftonline.com` and `graph.microsoft.com`. Use it when auth
+  appears to hang to distinguish network problems from flow problems.
+- **Standalone CLI** — `python -m office365_connector <command>` runs the
+  full blocking device-code flow, status check, diagnostic, and account
+  management from a shell. Useful for producing a token file on a machine
+  that can reach the browser (e.g. your laptop) and copying it into a
+  restricted container.
+- `office365_auth_status` now also reports any in-flight pending flow and
+  its remaining time.
+
+### Migration from v3.0.0
+
+No code changes required for callers. The agent will naturally use the
+new `login` (non-blocking) + `login_poll` pair if both tools are
+registered. If any half-completed pending flow exists at upgrade time, it
+expires automatically after its original TTL (~10 min) and is then ignored.
+
 ## [3.0.0] - 2026-05-16
 
 ### Changed — Hermes Agent plugin port
